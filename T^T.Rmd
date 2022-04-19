@@ -1,0 +1,582 @@
+---
+title: 'T^T'
+author: "Yudongfang Qin"
+date: "4/8/2022"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## load the dataset
+```{r}
+GENE_ANNO_GTF = system.file("extdata", "example.gtf", package="exomePeak2lite")
+f1 = system.file("extdata", "IP1.bam", package="exomePeak2lite")
+f2 = system.file("extdata", "IP2.bam", package="exomePeak2lite")
+f3 = system.file("extdata", "IP3.bam", package="exomePeak2lite")
+f4 = system.file("extdata", "IP4.bam", package="exomePeak2lite")
+IP_BAM = c(f1,f2,f3,f4)
+f1 = system.file("extdata", "Input1.bam", package="exomePeak2lite")
+f2 = system.file("extdata", "Input2.bam", package="exomePeak2lite")
+f3 = system.file("extdata", "Input3.bam", package="exomePeak2lite")
+INPUT_BAM = c(f1,f2,f3)
+f1 = system.file("extdata", "treated_IP1.bam", package="exomePeak2lite")
+TREATED_IP_BAM = c(f1)
+f1 = system.file("extdata", "treated_Input1.bam", package="exomePeak2lite")
+TREATED_INPUT_BAM = c(f1)
+```
+
+
+```{r message = FALSE, results = "hide"}
+  library(exomePeak2lite)
+  library(BSgenome.Hsapiens.UCSC.hg19)
+  library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  require(GenomicRanges)
+  require(SummarizedExperiment)
+  require(DESeq2)
+  require(Rsamtools)
+  require(GenomicAlignments)
+```
+
+
+## Peak Calling function - parameters
+```{r}
+bam_IP = IP_BAM
+bam_input = INPUT_BAM
+txdb = TxDb.Hsapiens.UCSC.hg19.knownGene
+genome = Hsapiens
+bin_size = 72
+step_size = 36
+fragment_length = 100
+strandness = c("unstrand", "1st_strand", "2nd_strand")
+gff = NULL
+plot_gc = TRUE
+p_cutoff = c(1e-05,1e-010,1e-15,1e-20)
+lfc_threshold = 0
+alt_hypothesis = c("greaterAbs", "lessAbs", "greater", "less")
+peak_calling_based = TRUE
+save_se = FALSE
+plot_gc = FALSE
+parallel = 1
+```
+
+```{r}
+  if(is.null(gff) & is.null(txdb)){
+    stop("Please at least provide one among gff and TxDb for transcript annotation.")
+  
+  if(is.null(txdb) & !is.null(gff)){
+    txdb <- makeTxDbFromGFF(gff)
+  }
+  }
+```
+
+```{r}
+  if(!(all(file.exists(bam_IP)) & all(file.exists(bam_input)))){
+    stop("At least one bam file directories provided cannot be found.")
+  }
+```
+
+```{r, include=FALSE}
+## A function to extract exons grouped by unambiguous genes
+exonsByiGenes <- function(txdb){
+  exbg <- exonsBy(txdb, by = "gene")
+  exbg <- exbg[elementNROWS(range(exbg)) == 1]
+  fol <- findOverlaps(exbg)
+  fol <- fol[queryHits(fol) != subjectHits(fol)]
+  ol_indx_M <- as.matrix(fol)
+  if (nrow(ol_indx_M) == 0) {
+    return(reduce(exbg))
+  }
+  else {
+    rm(fol)
+    new_gene_names_temp <- names(exbg)
+    new_gene_names_list <- split(new_gene_names_temp, seq_along(new_gene_names_temp))
+    for (i in seq_len(nrow(ol_indx_M))) {
+      temp_i <- ol_indx_M[i, 1]
+      new_gene_names_list[[temp_i]] <- c(new_gene_names_list[[temp_i]],
+                                         new_gene_names_temp[ol_indx_M[i, 2]])
+    }
+    rm(ol_indx_M, temp_i, new_gene_names_temp)
+    new_gene_names_list <- lapply(new_gene_names_list, sort)
+    new_gene_names <- vapply(new_gene_names_list, function(x) paste(x,
+                                                                    collapse = ","), character(1))
+    names(exbg) <- new_gene_names
+    rm(new_gene_names, new_gene_names_list)
+    rd_exons <- reduce(unlist(exbg), min.gapwidth = 0L)
+    fol <- findOverlaps(rd_exons, exbg)
+    split_indx <- rep(NA, length(rd_exons))
+    split_indx[queryHits(fol)] <- names(exbg)[subjectHits(fol)]
+    unique_exons_gene <- split(rd_exons, split_indx)
+    return(unique_exons_gene)
+  }
+}
+```
+
+```{r, include=FALSE}
+removeIntrons <- function(grl,
+                          exByGene){
+    #Calculate intronic regions
+    Introns_iranges <- gaps(ranges(exByGene))
+    unlist_ebg <- unlist(exByGene)
+
+    seq_lev <- tapply(as.vector( seqnames(unlist_ebg) ), names(unlist_ebg), function(x) x[1] )
+    strand_lev <- tapply(as.vector( strand(unlist_ebg) ), names(unlist_ebg), function(x) x[1] )
+
+    #Find the mapping between introns and bins, for only those bins that "contain" introns.
+    introns_granges <- GRanges(
+      seqnames = rep(seq_lev, elementNROWS(Introns_iranges)),
+      ranges = unlist(Introns_iranges),
+      strand = rep(strand_lev, elementNROWS(Introns_iranges))
+    )
+
+    fol <- findOverlaps(introns_granges,
+                        grl,
+                        type = "within")
+
+    #Remove all the hits that are inter-genes.
+    indx_keep <- names(introns_granges)[queryHits(fol)] == gsub("\\.[0-9]*$","",names(exByGene))[grl$transcriptsHits[subjectHits(fol)]]
+    fol <- fol[indx_keep,]
+
+    #Split, and re-define the start and ends of those hitted bins.
+    indx_Hitted_bins <-  subjectHits(fol)
+
+    bins_contain_introns <- grl[indx_Hitted_bins]
+    mcols(bins_contain_introns) <- NULL
+    names(bins_contain_introns) <- indx_Hitted_bins
+
+    #For each element within this GRanges, there is going to be one intron / multiple introns.
+
+    introns_each_bins <- introns_granges[queryHits(fol)]
+    names(introns_each_bins) <- indx_Hitted_bins
+
+    bins_contain_introns <- c(bins_contain_introns,introns_each_bins)
+    bins_contain_introns <- split(bins_contain_introns,names(bins_contain_introns))
+
+    if(length(bins_contain_introns) == 0) {
+
+      bins_intron_removed <- grl
+      return(bins_intron_removed)
+
+    }else{
+      chunk_num = 1e5
+      index_start = 1
+      for(i in seq_len(ceiling( length(bins_contain_introns)/chunk_num ))) {
+        Indx <- index_start:min(i*chunk_num, length(bins_contain_introns))
+        bins_contain_introns[Indx] <- disjoin(bins_contain_introns[Indx])
+        index_start = i*chunk_num + 1
+      }
+
+      #Remove the introns from GRanges list.
+      bins_contain_introns <- unlist(bins_contain_introns)
+      bins_contain_introns <- subsetByOverlaps(bins_contain_introns,
+                                               introns_granges,
+                                               type = "equal",invert = TRUE)
+      indx_non_introns <- which( !seq_along(grl) %in% indx_Hitted_bins )
+
+      bins_without_granges <- grl[indx_non_introns]
+      mcols(bins_without_granges) <- NULL
+      names(bins_without_granges) <- indx_non_introns
+
+      bins_intron_removed <- c(bins_without_granges,bins_contain_introns)
+
+      rm(bins_without_granges)
+      rm(bins_contain_introns)
+
+      bins_intron_removed <- bins_intron_removed[order(as.numeric(names(bins_intron_removed)))]
+      names(bins_intron_removed) <- names(grl)[as.integer( names(bins_intron_removed) )]
+
+      bins_intron_removed <- split(bins_intron_removed, names(bins_intron_removed))
+      bins_intron_removed <- bins_intron_removed[order(as.numeric(names(bins_intron_removed)))]
+
+      return(bins_intron_removed)
+    }
+}
+
+```
+
+```{r, include=FALSE}
+## A function to generate sliding window on mature RNA transcript
+exonicBins <- function(exByGene,
+                       binWidth = 72,
+                       stepWidth = 36) {
+require(GenomicFeatures)
+require(AnnotationDbi)
+#Partition exons by genes
+  stopifnot(stepWidth <= binWidth)
+  #步长需小于等于滑块长度
+  tx_widths <- sum(width(exByGene))
+
+  #Try to define the bins start always from the five prime ends of any transcripts / genes.
+
+  bin_nums_on_tx <-
+    ceiling(pmax((tx_widths - binWidth) / stepWidth, 1)) + 1 #About 7 million exome bins on hg19.
+
+  strands_tx <- as.vector(strand(unlist(range(exByGene))))
+
+  indx_plus <- strands_tx == "+"
+
+  indx_minus <- strands_tx == "-"
+
+  indx_unknown <- strands_tx == "*"
+
+  strands_bins <- rep(strands_tx, bin_nums_on_tx)
+
+  indx_bin_plus <- strands_bins == "+"
+
+  indx_bin_minus <- strands_bins == "-"
+
+  indx_bin_unknown <- strands_bins == "*"
+
+  seqnames_bins <- rep(names(tx_widths), bin_nums_on_tx)
+
+  bin_starts_on_tx <- vector("integer", length = sum(bin_nums_on_tx))
+
+  bin_starts_on_tx[indx_bin_plus] <-
+    unlist(lapply(bin_nums_on_tx[indx_plus], function(x)
+      seq(1, stepWidth * x, by = stepWidth)), use.names = FALSE)
+
+  bin_starts_on_tx[indx_bin_minus] <-
+    unlist(mapply(
+      function(x, y)
+        seq(y, y - stepWidth * (x - 1), by = -1 * stepWidth),
+      bin_nums_on_tx[indx_minus],
+      tx_widths[indx_minus]
+    ),
+    use.names = FALSE) - binWidth + 1
+
+  bin_starts_on_tx[indx_bin_unknown] <-
+    unlist(lapply(bin_nums_on_tx[indx_unknown], function(x)
+      seq(1, stepWidth * x, by = stepWidth)), use.names = FALSE)
+
+  rm(bin_nums_on_tx,
+     strands_tx,
+     indx_plus,
+     indx_minus,
+     indx_unknown,
+     indx_bin_plus,
+     indx_bin_minus,
+     indx_bin_unknown)
+
+  bins_on_tx <- GRanges(
+    seqnames = seqnames_bins,
+    ranges = IRanges(start = bin_starts_on_tx,
+                     width = binWidth),
+    strand = strands_bins
+  )
+
+  #Trim over-hanging ends
+  tx_widths <- sum(width(exByGene))
+
+  suppressWarnings(seqlengths(bins_on_tx) <-
+                     tx_widths[names(seqlengths(bins_on_tx))])
+
+  bins_on_tx <- trim(bins_on_tx)
+
+  bins_on_tx <- bins_on_tx[width(bins_on_tx) >= 10]
+
+  bins_on_genome <-
+    suppressWarnings(mapFromTranscripts(bins_on_tx, exByGene))
+
+  names(bins_on_genome) <- seq_along(bins_on_genome)
+
+  rm(bins_on_tx)
+
+  #Removal of introns is time consuming ~ 1min.
+  bins_on_genome <-
+    removeIntrons(bins_on_genome, exByGene)
+
+  return(bins_on_genome)
+}
+```
+
+```{r, include=FALSE,message=FALSE, results='hide'}
+require(mclust)
+## A function to count reads overlapped with features
+featuresCounts <- function(features,
+                           bam_dirs,
+                           strandness = c("unstrand",
+                                          "1st_strand",
+                                          "2nd_strand"),
+                           parallel = 1,
+                           yield_size = 5000000){
+  require(GenomicAlignments)
+  require(BiocParallel)
+
+  ## Setup parallel number
+  register(SerialParam())
+  suppressWarnings( register(MulticoreParam(workers = parallel)) )
+  register(SnowParam(workers = parallel))
+
+  ## Setup bam file list
+#  bam_lst <- BamFileList(file = bam_dirs, asMates = TRUE)
+#  yield_size = yieldSize(bam_lst) 
+
+  
+  ## Count using summarizeOverlaps (= HTSeq count Union)
+  preprocess_func <- NULL
+  
+  se <- summarizeOverlaps(
+    features = features,
+    reads = bam_dirs,
+    mode = "Union",
+    inter.feature = FALSE,
+    singleEnd = FALSE,
+    preprocess.reads = preprocess_func,
+    ignore.strand = FALSE,
+    fragments = TRUE
+  )
+  return(se)
+}
+```
+
+
+
+
+```{r}
+  #Extract bins for count
+  exByGene  <- exonsByiGenes(txdb)
+  peakBins <- exonicBins(exByGene, bin_size, step_size)
+  mcols(peakBins) <- NULL
+```
+
+```{r}
+  #Count the bam files
+  bam_dirs <- c(IP_BAM,INPUT_BAM)
+  se <- featuresCounts(peakBins, bam_dirs, strandness, parallel)
+
+```
+
+
+# separate the + - strand 
+```{r}
+require(Rsamtools)
+# a function to read bam and separate it into two GRanges based on the strand
+sep2strand <- function(bam_dirs,strand_i){
+    bamfile <- BamFile(bam_dirs)
+    gal <- readGAlignments(bamfile)
+    index <- as.vector(strand(gal))==strand_i
+    gal_single_strand <- gal[index]
+    return(gal_single_strand)
+
+}
+```
+
+
+
+#identify background
+```{r}
+classifyBackground <- function(se, gmm_cut = 5){
+  require(mclust)
+  IP_count <- assay(se[,se$IP_input == "IP"])
+  input_count <- assay(se[,se$IP_input == "input"])
+
+  input_sum <- rowSums(input_count)
+  IP_sum <- rowSums(IP_count)
+  indx_ratio <- (input_sum >= gmm_cut) & (IP_sum >= gmm_cut) #index: rowsum大于5
+  logMratio <- log(IP_sum[indx_ratio] / input_sum[indx_ratio])
+
+    rm(input_sum, IP_sum)
+
+  gmm_fit <- Mclust(logMratio, G = 2)
+  rm(logMratio)
+
+  bg_class <- gmm_fit$parameters$mean
+  bg_indx <- gmm_fit$classification == names(bg_class)[which.min(bg_class)]
+  candidate_indx<-gmm_fit$classification == names(bg_class)[which.max(bg_class)]
+  
+  print(bg_class)
+  rm(gmm_fit, bg_class)
+  rm(IP_count, input_count)
+
+  rowData(se) <- DataFrame(bg = FALSE,candidate = FALSE)
+  rowData(se)$bg[which(indx_ratio)[bg_indx]] <- TRUE
+  rowData(se)$candidate[which(indx_ratio)[candidate_indx]] <- TRUE
+  return(se)
+  
+}
+
+```
+
+
+
+```{r}
+  #Annotate SummarizedExperiment
+  se$IP_input <- rep(c("IP","input"), c(length(IP_BAM),length(INPUT_BAM)))
+  bam_dirs<-c(IP_BAM,INPUT_BAM)
+  
+  #Identify Backgrounds
+  se <- classifyBackground(se)
+  
+```
+
+
+```{r}
+## A function to estimate sequencing depth size factor from background
+estimateColumnFactors <- function(se){
+  require(magrittr)
+  stopifnot(!is.null(rowData(se)$bg))
+  se$sf <- assay(se)[rowData(se)$bg,] %>% apply(., 2, function(x) median(x[x>0]))
+  return(se)
+}
+```
+
+```{r}
+  #Estimate sample size factors
+  se <- estimateColumnFactors(se)
+```
+
+# - strand
+```{r}
+se_sf <- se
+rowData(se_sf)$peak <- rowData(se)$candidate
+for( i in 1:ncol(assay(se_sf))){
+  assay(se_sf)[,i] <- assay(se)[,i]/se$sf[i]
+}
+bg_ratio<-sum(assay(se)[rowData(se)$bg,colData(se)$IP_input=='IP'])/sum(assay(se)[rowData(se)$bg,colData(se)$IP_input=='input'])
+candidate<-assay(se_sf)[rowData(se)$candidate,]
+ratio<-rowSums(candidate[,colData(se)$IP_input=='IP'])/rowSums(candidate[,colData(se)$IP_input=='input'])
+filtered_index<-(ratio>= 10*bg_ratio) &(ratio <= 30* bg_ratio)
+assay(se_sf)[strtoi(rownames(candidate[filtered_index,])),]
+```
+
+```{r}
+ranges(peakBins[strtoi(rownames(candidate[filtered_index,]))])
+```
+
+
+```{r}
+## A function to reduce GRangesList on the coordinate of mature RNA transcript
+reducePeaks <- function(grl,
+                        exByGene) {
+  reduced_peaks_on_genome <- mapFromTranscripts( reduce( mapToTranscripts( unlist(grl) , exByGene) ), exByGene )
+  names(reduced_peaks_on_genome) <- reduced_peaks_on_genome$xHits
+  reduced_peaks_on_genome <- removeIntrons( reduced_peaks_on_genome, exByGene )
+  if(is(reduced_peaks_on_genome, "GRanges")){
+    mcols(reduced_peaks_on_genome) <- NULL
+    reduced_peaks_on_genome <- split(reduced_peaks_on_genome, seq_along(reduced_peaks_on_genome))
+  }
+  return(reduced_peaks_on_genome)
+}
+```
+
+```{r}
+exonicFlank <- function(grl,
+                        exByGene,
+                        flankLength = 100){
+  bd_on_tx <- mapToTranscripts(unlist(grl), exByGene)
+  #remove names of the inner Granges (so don't contain . in the grangeslist name.)
+  names(bd_on_tx) <- gsub("\\..*$","",names(bd_on_tx))
+  bd_on_tx <- unlist( range( split(bd_on_tx, names(bd_on_tx)) ) )
+  bins_on_tx <- bd_on_tx + flankLength
+  rm(bd_on_tx)
+
+  #Trim over-hanging ends
+  tx_widths <- sum( width(exByGene) )
+  suppressWarnings( seqlengths(bins_on_tx) <- tx_widths[names(seqlengths(bins_on_tx))] )
+  bins_on_tx <- trim(bins_on_tx)
+  bins_on_genome <- suppressWarnings(  mapFromTranscripts(bins_on_tx,exByGene) )
+  rm(bins_on_tx)
+  bins_on_genome <- trim( removeIntrons(bins_on_genome,exByGene) )
+  return(bins_on_genome)
+}
+```
+
+```{r}
+peak_0 <- rowRanges(se[strtoi(rownames(candidate[filtered_index,]))])
+peak_Flank <- exonicFlank(peak_0,exByGene)
+
+```
+
+
+
+```{r}
+
+
+peak <- reducePeaks(peak_Flank,exByGene)
+peak
+```
+
+
+
+```{r}
+library(stringr)
+library(ggplot2)
+for (i_peak in 1:length(peak)){
+peak_i <- peak[[i_peak]]
+if(length(peak_i)>1){
+  next
+}
+print(peak_i)
+gal_ip <- readGAlignments(BamFile(bam_IP[1]))
+for(i in 2:length(bam_IP)){
+  gal_ip <- c(gal_ip,readGAlignments(BamFile(bam_IP[i])))
+}
+gal_input <- readGAlignments(BamFile(bam_input[1]))
+for(i in 2:length(bam_input)){
+  gal_input <- c(gal_ip,readGAlignments(BamFile(bam_input[i])))
+}
+
+gal_posttive <- gal_ip[as.vector(strand(gal_ip))=="+"]
+gal_negative <- gal_ip[as.vector(strand(gal_ip))=="-"]
+superposition_p <- findOverlaps(peak_i,gal_posttive,ignore.strand=TRUE)
+superposition_n <- findOverlaps(peak_i,gal_negative,ignore.strand=TRUE)
+superposition_input <- findOverlaps(peak_i,gal_input,ignore.strand=TRUE)
+sequences_p <-gal_posttive[subjectHits(superposition_p)]
+sequences_n <-gal_negative[subjectHits(superposition_n)]
+sequences_input <-gal_input[subjectHits(superposition_input)]
+range_p <- integer(width(peak_i))
+range_n <- integer(width(peak_i))
+range_input <- integer(width(peak_i))
+if (length(sequences_p)>0){
+for (i in 1:length(sequences_p)) {
+    range_p[max(start(sequences_p)[i]-start(peak_i),1):min(start(sequences_p)[i]-start(peak_i)+width(sequences_p)[i],width(peak_i))] <- range_p[max(start(sequences_p)[i]-start(peak_i),1):min(start(sequences_p)[i]-start(peak_i)+width(sequences_p)[i],width(peak_i))] + 1
+}}
+if (length(sequences_n)>0){
+for (i in 1:length(sequences_n)) {
+    range_n[max(start(sequences_n)[i]-start(peak_i),1):min(start(sequences_n)[i]-start(peak_i)+width(sequences_n)[i],width(peak_i))] <- range_n[max(start(sequences_n)[i]-start(peak_i),1):min(start(sequences_n)[i]-start(peak_i)+width(sequences_n)[i],width(peak_i))] + 1
+}}
+for (i in 1:length(sequences_input)) {
+    range_input[max(start(sequences_input)[i]-start(peak_i),1):min(start(sequences_input)[i]-start(peak_i)+width(sequences_input)[i],width(peak_i))] <- range_input[max(start(sequences_input)[i]-start(peak_i),1):min(start(sequences_input)[i]-start(peak_i)+width(sequences_input)[i],width(peak_i))] + 1
+}
+df <- data.frame(location = start(peak_i):end(peak_i),read = range_p,read_n = -range_n,input = range_input, log_ip_input = log((range_p+range_n+1) / (range_input+1)))
+
+rbind(df,df)
+top <- ggplot() +
+  geom_abline(slope=0, aes(location, peak)) +
+  geom_line(data = df, aes(location, read), colour = 'Tomato') +
+  geom_line(data = df, aes(location, peak_n), colour = 'blue') 
+bottom <- ggplot+geom_line(data = df, aes(location, log_ip_input))
+file_name <- str_c(i_peak,".pdf")
+ggsave(file_name,plot = c(top,bottom))
+}
+```
+
+
+
+
+
+```{r}
+library(stringr)
+str_c(1,".pdf")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
